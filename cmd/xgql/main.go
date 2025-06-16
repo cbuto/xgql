@@ -16,14 +16,17 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	stdlog "log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	// NOTE(tnthornton) we are making an active choice to have a pprof endpoint
@@ -60,6 +63,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -298,6 +302,9 @@ func main() { //nolint:gocyclo
 	kingpin.FatalIfError(startHealth(internal.HealthOptions{Health: *health, HealthPort: *healthPort}, log), "cannot start health endpoints")
 
 	if *tlsCert != "" && *tlsKey != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
 		srv := &http.Server{
 			Addr:              *listen,
 			Handler:           rt,
@@ -306,10 +313,33 @@ func main() { //nolint:gocyclo
 			ReadHeaderTimeout: 5 * time.Second,
 			ErrorLog:          stdlog.New(io.Discard, "", 0),
 		}
+
+		watcher, err := certwatcher.New(*tlsCert, *tlsKey)
+		kingpin.FatalIfError(err, "failed to create cert watcher")
+
+		go func() {
+			kingpin.FatalIfError(watcher.Start(ctx), "failed to start cert watcher")
+		}()
+
+		srv.TLSConfig = &tls.Config{
+			GetCertificate: watcher.GetCertificate,
+		}
+
 		go func() {
 			log.Debug("Listening for TLS connections", "address", *listen)
-			kingpin.FatalIfError(srv.ListenAndServeTLS(*tlsCert, *tlsKey), "cannot serve TLS HTTP")
+			err := srv.ListenAndServeTLS("", "")
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				kingpin.FatalIfError(err, "failed to run HTTPS server")
+			}
 		}()
+
+		<-ctx.Done()
+		log.Debug("Shutting down server...")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		kingpin.FatalIfError(srv.Shutdown(shutdownCtx), "failed to shutdown server gracefully")
 	}
 
 	log.Debug("Listening for insecure connections", "address", *insecure)
