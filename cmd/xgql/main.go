@@ -24,8 +24,10 @@ import (
 	stdlog "log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	// NOTE(tnthornton) we are making an active choice to have a pprof endpoint
@@ -62,6 +64,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -305,6 +308,9 @@ func main() { //nolint:gocyclo
 	kingpin.FatalIfError(startHealth(internal.HealthOptions{Health: *health, HealthPort: *healthPort}, log), "cannot start health endpoints")
 
 	if *tlsCert != "" && *tlsKey != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
 		srv := &http.Server{
 			Addr:              *listen,
 			Handler:           rt,
@@ -313,21 +319,47 @@ func main() { //nolint:gocyclo
 			ReadHeaderTimeout: 5 * time.Second,
 			ErrorLog:          stdlog.New(io.Discard, "", 0),
 		}
+
+		tlsConfig := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+
+		// If client CA bundle provided, add client auth config
 		if len(*clientCABundle) > 0 {
 			p, err := getCertPool(*clientCABundle)
-			if err != nil {
-				kingpin.FatalIfError(err, "cannot initialize the client CA pool from the specified bundle %s", *clientCABundle)
-			}
-			srv.TLSConfig = &tls.Config{
-				ClientAuth: tls.VerifyClientCertIfGiven,
-				ClientCAs:  p,
-				MinVersion: tls.VersionTLS12,
-			}
+			kingpin.FatalIfError(err, "cannot initialize the client CA pool from the specified bundle %s", *clientCABundle)
+			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+			tlsConfig.ClientCAs = p
 		}
+
+		srv.TLSConfig = tlsConfig
+
+		// Setup cert watcher for dynamic cert reload
+		watcher, err := certwatcher.New(*tlsCert, *tlsKey)
+		kingpin.FatalIfError(err, "cannot create cert watcher")
+
+		go func() {
+			kingpin.FatalIfError(watcher.Start(ctx), "cannot start cert watcher")
+		}()
+
+		// Use watcher to get certificate dynamically
+		srv.TLSConfig.GetCertificate = watcher.GetCertificate
+
 		go func() {
 			log.Debug("Listening for TLS connections", "address", *listen)
-			kingpin.FatalIfError(srv.ListenAndServeTLS(*tlsCert, *tlsKey), "cannot serve TLS HTTP")
+			err := srv.ListenAndServeTLS("", "")
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				kingpin.FatalIfError(err, "cannot serve TLS HTTP")
+			}
 		}()
+
+		<-ctx.Done()
+		log.Debug("Shutting down server...")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		kingpin.FatalIfError(srv.Shutdown(shutdownCtx), "cannot shutdown server gracefully")
 	}
 
 	log.Debug("Listening for insecure connections", "address", *insecure)
