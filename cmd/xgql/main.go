@@ -330,7 +330,7 @@ func main() { //nolint:gocyclo
 		}()
 	}
 
-	log.Debug("Listening for insecure connections", "address", *insecure)
+	log.Debug("Listening for insecure connectionss", "address", *insecure)
 	srv := &http.Server{
 		Addr:              *insecure,
 		Handler:           rt,
